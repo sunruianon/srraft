@@ -222,6 +222,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.Lock()
 	defer rf.Unlock()
 
+	nextIndex := func() int {
+		if len(rf.log) > 0 {
+			return rf.log[len(rf.log)-1].Index + 1
+		}
+		return Max(1, rf.lastSnapshotIndex+1)
+	}()
+	
 	entry := LogEntry{Index: nextIndex, Term: rf.currentTerm, Command: command}
 	rf.log = append(rf.log, entry)
 
