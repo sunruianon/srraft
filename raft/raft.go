@@ -211,6 +211,12 @@ func (rf *Raft) sendRequestVote(serverConn *labrpc.ClientEnd, server int, voteCh
 	}
 }
 
+func Max(x, y int) int {
+	if x > y {
+		return x
+	}
+	return y
+}
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term, isLeader := rf.GetState()
@@ -228,7 +234,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 		return Max(1, rf.lastSnapshotIndex+1)
 	}()
-	
+
 	entry := LogEntry{Index: nextIndex, Term: rf.currentTerm, Command: command}
 	rf.log = append(rf.log, entry)
 
