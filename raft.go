@@ -209,9 +209,16 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+func (rf *Raft) sendRequestVote(serverConn *labrpc.ClientEnd, server int, voteChan chan int, args *RequestVoteArgs, reply *RequestVoteReply) {
+	requestName := "Raft.RequestVote"
+	request := func() bool{
+		return severConn.Call(requestName, args, reply)
+	}
+	if ok := SendrpcRequest(requestName, request); ok{
+		voteChan <- server
+	}
+	///ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	///return ok
 }
 
 
@@ -229,12 +236,27 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	term, isLeader := rf.GetState()
 
+	if !isLeader {
+		return -1, term, isLeader
+	}
+	
+	rf.Lock()
+	defer rf.Unlock()
 
-	return index, term, isLeader
+	nextIndex := func() int{
+		if len(rf.log) > 0{
+			return rf.log[len(rf.log)-1].Index + 1
+		}
+		return Max(1, rf.lastSnapshotIndex+1)
+	}()
+
+	entry := LogEntry{Index: nextIndex, Term: rf.currentTrem, Commang: commang}
+	rf.log = append(rf.log, entry)
+	RaftInfo("New entry appended to leader's log: %s", rf, entry)
+
+	return nextindex, term, isLeader
 }
 
 //
@@ -245,6 +267,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	rf.Lock()
+	defer rf.Unlock()
+
+	rf.isDecommissioned = true
+	RaftInfo("Node killed", rf)
 }
 
 //
