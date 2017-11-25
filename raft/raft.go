@@ -86,6 +86,14 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.currentTerm, rf.state == Leader
 }
 
+func (rf *Raft) getLastEntryInfo() (int, int) {
+	if len(rf.log) > 0 {
+		entry := rf.log[len(rf.log)-1]
+		return entry.Index, entry.Term
+	}
+	return rf.lastSnapshotIndex, rf.lastSnapshotTerm
+}
+
 func (rf *Raft) persist() {
 	buf := new(bytes.Buffer)
 	gob.NewEncoder(buf).Encode(
@@ -122,6 +130,19 @@ type RequestVoteReply struct {
 	Id			string
 }
 
+func (rf *Raft) transitionToCandidate() {
+	rf.state = Candidate
+	// Increment currentTerm and vote for self
+	rf.currentTerm++
+	rf.votedFor = rf.id
+}
+
+func (rf *Raft) transitionToFollower(newTerm int) {
+	rf.state = Follower
+	rf.currentTerm = newTerm
+	rf.votedFor = ""
+}
+
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.Lock()
 	defer rf.Unlock()
@@ -129,7 +150,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	lastIndex, lastTerm := rf.getLastEntryInfo()
 	logUpToDate := func() bool {
 		if lastTerm == args.LastLogTerm {
-			return lastIndex <= args.LatLogIndex
+			return lastIndex <= args.LastLogIndex
 		}
 		return lastTerm < args.LastLogTerm
 	}()
@@ -139,7 +160,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term < rf. currentTerm {
 		reply.VoteGranted = false
-	} else if arfs.Term >= rf.currentTerm && logUpToDate{
+	} else if args.Term >= rf.currentTerm && logUpToDate{
 		rf.transitionToFollower(args.Term)
 		rf.votedFor = args.CandidateID
 		reply.VoteGranted = true
@@ -151,17 +172,35 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.persist()
 }
 
+func SendRPCRequest(requestName string, request func() bool) bool {
+	makeRequest := func(successChan chan struct{}) {
+		if ok := request(); ok {
+			successChan <- struct{}{}
+		}
+	}
+
+	for attempts := 0; attempts < RPCMaxTries; attempts++ {
+		rpcChan := make(chan struct{}, 1)
+		go makeRequest(rpcChan)
+		select {
+		case <-rpcChan:
+			return true
+		case <-time.After(RPCTimeout):
+		}
+	}
+
+	return false
+}
+
 func (rf *Raft) sendRequestVote(serverConn *labrpc.ClientEnd, server int, voteChan chan int, args *RequestVoteArgs, reply *RequestVoteReply) {
 	requestName := "Raft.RequestVote"
 	request := func() bool{
-		return severConn.Call(requestName, args, reply)
+		return serverConn.Call(requestName, args, reply)
 	}
-	if ok := SendrpcRequest(requestName, request); ok{
+	if ok := SendRPCRequest(requestName, request); ok{
 		voteChan <- server
 	}
 }
-
-
 
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -174,14 +213,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.Lock()
 	defer rf.Unlock()
 
-	nextIndex := func() int{
-		if len(rf.log) > 0{
-			return rf.log[len(rf.log)-1].Index + 1
-		}
-		return Max(1, rf.lastSnapshotIndex+1)
-	}()
 
-	entry := LogEntry{Index: nextIndex, Term: rf.currentTrem, Commang: commang}
+
+	entry := LogEntry{Index: nextIndex, Term: rf.currentTerm, Commang: commang}
 	rf.log = append(rf.log, entry)
 
 	return nextindex, term, isLeader
