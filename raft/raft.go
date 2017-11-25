@@ -19,11 +19,12 @@ package raft
 
 import "sync"
 import "labrpc"
-import "math/rand"
+import "time"
 
 import "bytes"
 import "encoding/gob"
 
+type SErverState string
 
 type ApplyMsg struct {
 	Index       int
@@ -67,6 +68,12 @@ type RaftPersistence struct {
 	VotedFor	string
 }
 
+type LogEntry struct{
+	Index int
+	Term int
+	Command interface{}
+}
+
 func (rf *Raft) GetState() (int, bool) {
 	rf.Lock()
 	defer rf.Unlock()
@@ -82,8 +89,7 @@ func (rf *Raft) persist() {
 			VotedFor:		   rf.votedFor,
 			LastSnapshotIndex: rf.lastSnapshotIndex,
 			LastSnapshotTerm:  rf.lastSnapshotTerm,
-		}
-	)
+		})
 	RaftDebug("Persisting node data (%d bytes)", rf, buf.Len())
 	rf.persister.SaveRaftState(buf.Bytes())
 }
@@ -155,7 +161,7 @@ func (rf *Raft) sendRequestVote(serverConn *labrpc.ClientEnd, server int, voteCh
 
 func (rf *Raft) AppendEntries(args *AppendEntrisesArgs, reply *AppendEntriesReply) {
 	rf.Lock()
-	defer rf.Unlock
+	defer rf.Unlock()
 
 	RaftInfo("Request from %s, w/ %d entries. Args.Prev:[Index %d, Term %d]", rf, args.LeaderID, len(args.LogEntries), args.PreviousLogIndex, args.PreviousLogTerm)
 	
