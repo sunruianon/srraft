@@ -24,7 +24,13 @@ import "time"
 import "bytes"
 import "encoding/gob"
 
-type SErverState string
+type ServerState string
+
+const (
+	Follower ServerState = "Follower"
+	Candidate = "Candidate"
+	Leader = "Leader"
+)
 
 type ApplyMsg struct {
 	Index       int
@@ -49,7 +55,7 @@ type Raft struct {
 	leaderID	string
 
 	// Log state
-	Log			[]LogEntry
+	log			[]LogEntry
 	commitIndex int
 	lastApplied int
 
@@ -59,7 +65,7 @@ type Raft struct {
 	sendAppendChan []chan struct{}
 
 	// Liveness state
-	lastHeartBeat time.time
+	lastHeartBeat time.Time
 }
 
 type RaftPersistence struct {
@@ -87,10 +93,7 @@ func (rf *Raft) persist() {
 			CurrentTerm:	   rf.currentTerm,
 			Log:			   rf.log,
 			VotedFor:		   rf.votedFor,
-			LastSnapshotIndex: rf.lastSnapshotIndex,
-			LastSnapshotTerm:  rf.lastSnapshotTerm,
 		})
-	RaftDebug("Persisting node data (%d bytes)", rf, buf.Len())
 	rf.persister.SaveRaftState(buf.Bytes())
 }
 
@@ -146,7 +149,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	rf.persist()
-	RaftInfo("Vote requested for: %s on term: %d. Log up-to-date? %v. Vote granted? %v", rf, args.CandidateID, args.Term, logUpToDate, reply.VoteGranted)
 }
 
 func (rf *Raft) sendRequestVote(serverConn *labrpc.ClientEnd, server int, voteChan chan int, args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -159,101 +161,7 @@ func (rf *Raft) sendRequestVote(serverConn *labrpc.ClientEnd, server int, voteCh
 	}
 }
 
-func (rf *Raft) AppendEntries(args *AppendEntrisesArgs, reply *AppendEntriesReply) {
-	rf.Lock()
-	defer rf.Unlock()
 
-	RaftInfo("Request from %s, w/ %d entries. Args.Prev:[Index %d, Term %d]", rf, args.LeaderID, len(args.LogEntries), args.PreviousLogIndex, args.PreviousLogTerm)
-	
-		reply.Term = rf.currentTerm
-		if args.Term < rf.currentTerm {
-			reply.Success = false
-			return
-		} else if args.Term >= rf.currentTerm {
-			rf.transitionToFollower(args.Term)
-			rf.leaderID = args.LeaderID
-		}
-	
-		if rf.leaderID == args.LeaderID {
-			rf.lastHeartBeat = time.Now()
-		}
-	
-		// Try to find supplied previous log entry match in our log
-		prevLogIndex := -1
-		for i, v := range rf.log {
-			if v.Index == args.PreviousLogIndex {
-				if v.Term == args.PreviousLogTerm {
-					prevLogIndex = i
-					break
-				} else {
-					reply.ConflictingLogTerm = v.Term
-				}
-			}
-		}
-	
-		PrevIsInSnapshot := args.PreviousLogIndex == rf.lastSnapshotIndex && args.PreviousLogTerm == rf.lastSnapshotTerm
-		PrevIsBeginningOfLog := args.PreviousLogIndex == 0 && args.PreviousLogTerm == 0
-	
-		if prevLogIndex >= 0 || PrevIsInSnapshot || PrevIsBeginningOfLog {
-			if len(args.LogEntries) > 0 {
-				RaftInfo("Appending %d entries from %s", rf, len(args.LogEntries), args.LeaderID)
-			}
-	
-			// Remove any inconsistent logs and find the index of the last consistent entry from the leader
-			entriesIndex := 0
-			for i := prevLogIndex + 1; i < len(rf.log); i++ {
-				entryConsistent := func() bool {
-					localEntry, leadersEntry := rf.log[i], args.LogEntries[entriesIndex]
-					return localEntry.Index == leadersEntry.Index && localEntry.Term == leadersEntry.Term
-				}
-				if entriesIndex >= len(args.LogEntries) || !entryConsistent() {
-					// Additional entries must be inconsistent, so let's delete them from our local log
-					rf.log = rf.log[:i]
-					break
-				} else {
-					entriesIndex++
-				}
-			}
-	
-			// Append all entries that are not already in our log
-			if entriesIndex < len(args.LogEntries) {
-				rf.log = append(rf.log, args.LogEntries[entriesIndex:]...)
-			}
-	
-			// Update the commit index
-			if args.LeaderCommit > rf.commitIndex {
-				var latestLogIndex = rf.lastSnapshotIndex
-				if len(rf.log) > 0 {
-					latestLogIndex = rf.log[len(rf.log)-1].Index
-				}
-	
-				if args.LeaderCommit < latestLogIndex {
-					rf.commitIndex = args.LeaderCommit
-				} else {
-					rf.commitIndex = latestLogIndex
-				}
-			}
-			reply.Success = true
-		} else {
-			// §5.3: When rejecting an AppendEntries request, the follower can include the term of the
-			//	 	 conflicting entry and the first index it stores for that term.
-	
-			// If there's no entry with `args.PreviousLogIndex` in our log. Set conflicting term to that of last log entry
-			if reply.ConflictingLogTerm == 0 && len(rf.log) > 0 {
-				reply.ConflictingLogTerm = rf.log[len(rf.log)-1].Term
-			}
-	
-			for _, v := range rf.log { // Find first log index for the conflicting term
-				if v.Term == reply.ConflictingLogTerm {
-					reply.ConflictingLogIndex = v.Index
-					break
-				}
-			}
-	
-			reply.Success = false
-		}
-		rf.persist()
-}
 
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -275,7 +183,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	entry := LogEntry{Index: nextIndex, Term: rf.currentTrem, Commang: commang}
 	rf.log = append(rf.log, entry)
-	RaftInfo("New entry appended to leader's log: %s", rf, entry)
 
 	return nextindex, term, isLeader
 }
@@ -285,7 +192,6 @@ func (rf *Raft) Kill() {
 	defer rf.Unlock()
 
 	rf.isDecommissioned = true
-	RaftInfo("Node killed", rf)
 }
 
 func Make(peers []*labrpc.ClientEnd, me int,
@@ -300,7 +206,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		lastApplied: 0,
 	}
 
-	RaftInfo("Node created", rf)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
