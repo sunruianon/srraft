@@ -30,11 +30,16 @@ const (
 	Follower ServerState = "Follower"
 	Candidate = "Candidate"
 	Leader = "Leader"
+
+	RPCTimeout = 50 * time.Millisecond
+	RPCMaxTries = 3
 )
 
 type ApplyMsg struct {
 	Index       int
 	Command     interface{}
+	UseSnapshot bool
+	Snapshot	[]byte
 }
 
 type Raft struct {
@@ -58,6 +63,10 @@ type Raft struct {
 	log			[]LogEntry
 	commitIndex int
 	lastApplied int
+
+	// Log compaction state, if snapshots are enabled
+	lastSnapshotIndex int
+	lastSnapshotTerm  int
 
 	// leader state
 	nextIndex	   []int
@@ -213,12 +222,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.Lock()
 	defer rf.Unlock()
 
-
-
-	entry := LogEntry{Index: nextIndex, Term: rf.currentTerm, Commang: commang}
+	entry := LogEntry{Index: nextIndex, Term: rf.currentTerm, Command: command}
 	rf.log = append(rf.log, entry)
 
-	return nextindex, term, isLeader
+	return nextIndex, term, isLeader
 }
 
 func (rf *Raft) Kill() {
