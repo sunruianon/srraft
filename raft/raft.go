@@ -161,6 +161,18 @@ type AppendEntriesReply struct {
 	ConflictingLogIndex int // First index of the log for the above conflicting term
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          string
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 func (reply *RequestVoteReply) VoteCount() int {
 	if reply.VoteGranted {
 		return 1
@@ -227,6 +239,41 @@ func (rf *Raft) sendRequestVote(serverConn *labrpc.ClientEnd, server int, voteCh
 	if ok := SendRPCRequest(requestName, request); ok{
 		voteChan <- server
 	}
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.Lock()
+	defer rf.Unlock()
+
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		return
+	} else if args.Term >= rf.currentTerm {
+		rf.transitionToFollower(args.Term)
+		rf.leaderID = args.LeaderId
+	}
+
+	if rf.leaderID == args.LeaderId {
+		rf.lastHeartBeat = time.Now()
+	}
+
+	rf.persister.SaveSnapshot(args.Data) // Save snapshot, discarding any existing snapshot with smaller index
+
+	i, isPresent := rf.findLogIndex(args.LastIncludedIndex)
+	if isPresent && rf.log[i].Term == args.LastIncludedTerm {
+		// If existing log entry has same index and term as snapshot’s last included entry, retain log entries following it
+		rf.log = rf.log[i+1:]
+	} else { // Otherwise discard the entire log
+		rf.log = make([]LogEntry, 0)
+	}
+
+	rf.lastSnapshotIndex = args.LastIncludedIndex
+	rf.lastSnapshotTerm = args.LastIncludedTerm
+	rf.lastApplied = 0 // LocalApplyProcess will pick this change up and send snapshot
+
+	rf.persist()
+
+	RaftInfo("Installed snapshot from %s, LastSnapshotEntry(Index: %d, Term: %d)", rf, args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm)
 }
 
 func (rf *Raft) sendSnapshot(peerIndex int, sendAppendChan chan struct{}) {
