@@ -139,11 +139,26 @@ type RequestVoteArgs struct {
 	LastLogTerm  int
 }
 
-
 type RequestVoteReply struct {
 	Term		int
 	VoteGranted bool
 	Id			string
+}
+
+type AppendEntriesArgs struct {
+	Term             int
+	LeaderID         string
+	PreviousLogIndex int
+	PreviousLogTerm  int
+	LogEntries       []LogEntry
+	LeaderCommit     int
+}
+
+type AppendEntriesReply struct {
+	Term                int
+	Success             bool
+	ConflictingLogTerm  int // Term of the conflicting entry, if any
+	ConflictingLogIndex int // First index of the log for the above conflicting term
 }
 
 func (reply *RequestVoteReply) VoteCount() int {
@@ -212,6 +227,41 @@ func (rf *Raft) sendRequestVote(serverConn *labrpc.ClientEnd, server int, voteCh
 	if ok := SendRPCRequest(requestName, request); ok{
 		voteChan <- server
 	}
+}
+
+func (rf *Raft) sendSnapshot(peerIndex int, sendAppendChan chan struct{}) {
+	rf.Lock()
+
+	peer := rf.peers[peerIndex]
+	args := InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.leaderID,
+		LastIncludedIndex: rf.lastSnapshotIndex,
+		LastIncludedTerm:  rf.lastSnapshotTerm,
+		Data:              rf.persister.ReadSnapshot(),
+	}
+	reply := InstallSnapshotReply{}
+
+	rf.Unlock()
+
+	// Send RPC (with timeouts + retries)
+	requestName := "Raft.InstallSnapshot"
+	request := func() bool {
+		return peer.Call(requestName, &args, &reply)
+	}
+	ok := SendRPCRequest(requestName, request)
+
+	rf.Lock()
+	defer rf.Unlock()
+	if ok {
+		if reply.Term > rf.currentTerm {
+			rf.transitionToFollower(reply.Term)
+		} else {
+			rf.nextIndex[peerIndex] = args.LastIncludedIndex + 1
+		}
+	}
+
+	sendAppendChan <- struct{}{} // Signal to leader-peer process that there may be appends to send
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -404,6 +454,26 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 		}
 	}
 	rf.persist()
+}
+
+func (rf *Raft) updateCommitIndex() {
+	// §5.3/5.4: If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+	for i := len(rf.log) - 1; i >= 0; i-- {
+		if v := rf.log[i]; v.Term == rf.currentTerm && v.Index > rf.commitIndex {
+			replicationCount := 1
+			for j := range rf.peers {
+				if j != rf.me && rf.matchIndex[j] >= v.Index {
+					if replicationCount++; replicationCount > len(rf.peers)/2 { // Check to see if majority of nodes have replicated this
+						RaftInfo("Updating commit index [%d -> %d] as replication factor is at least: %d/%d", rf, rf.commitIndex, v.Index, replicationCount, len(rf.peers))
+						rf.commitIndex = v.Index // Set index of this entry as new commit index
+						break
+					}
+				}
+			}
+		} else {
+			break
+		}
+	}
 }
 
 func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
