@@ -24,6 +24,8 @@ import "time"
 import "bytes"
 import "encoding/gob"
 
+import "log"
+
 type ServerState string
 
 const (
@@ -31,6 +33,8 @@ const (
 	Candidate = "Candidate"
 	Leader = "Leader"
 
+	Debug = 0
+	
 	RPCTimeout = 50 * time.Millisecond
 	RPCMaxTries = 3
 )
@@ -181,26 +185,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.persist()
 }
 
-func SendRPCRequest(requestName string, request func() bool) bool {
-	makeRequest := func(successChan chan struct{}) {
-		if ok := request(); ok {
-			successChan <- struct{}{}
-		}
-	}
-
-	for attempts := 0; attempts < RPCMaxTries; attempts++ {
-		rpcChan := make(chan struct{}, 1)
-		go makeRequest(rpcChan)
-		select {
-		case <-rpcChan:
-			return true
-		case <-time.After(RPCTimeout):
-		}
-	}
-
-	return false
-}
-
 func (rf *Raft) sendRequestVote(serverConn *labrpc.ClientEnd, server int, voteChan chan int, args *RequestVoteArgs, reply *RequestVoteReply) {
 	requestName := "Raft.RequestVote"
 	request := func() bool{
@@ -211,11 +195,129 @@ func (rf *Raft) sendRequestVote(serverConn *labrpc.ClientEnd, server int, voteCh
 	}
 }
 
-func Max(x, y int) int {
-	if x > y {
-		return x
+func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
+	rf.Lock()
+	RaftInfo("Starting commit process - Last log applied: %d", rf, rf.lastApplied)
+	rf.Unlock()
+
+	for {
+		rf.Lock()
+
+		if rf.commitIndex >= 0 && rf.commitIndex > rf.lastApplied {
+			if rf.lastApplied < rf.lastSnapshotIndex { // We need to apply latest snapshot
+				RaftInfo("Locally applying snapshot with latest index: %d", rf, rf.lastSnapshotIndex)
+				rf.Unlock()
+
+				applyChan <- ApplyMsg{UseSnapshot: true, Snapshot: rf.persister.ReadSnapshot()}
+
+				rf.Lock()
+				rf.lastApplied = rf.lastSnapshotIndex
+				rf.Unlock()
+			} else {
+				startIndex, _ := rf.findLogIndex(rf.lastApplied + 1)
+				startIndex = Max(startIndex, 0) // If start index wasn't found, it's because it's a part of a snapshot
+
+				endIndex := -1
+				for i := startIndex; i < len(rf.log); i++ {
+					if rf.log[i].Index <= rf.commitIndex {
+						endIndex = i
+					}
+				}
+
+				if endIndex >= 0 { // We have some entries to locally commit
+					entries := make([]LogEntry, endIndex-startIndex+1)
+					copy(entries, rf.log[startIndex:endIndex+1])
+
+					RaftInfo("Locally applying %d log entries. lastApplied: %d. commitIndex: %d", rf, len(entries), rf.lastApplied, rf.commitIndex)
+					rf.Unlock()
+
+					for _, v := range entries { // Hold no locks so that slow local applies don't deadlock the system
+						RaftDebug("Locally applying log: %s", rf, v)
+						applyChan <- ApplyMsg{Index: v.Index, Command: v.Command}
+					}
+
+					rf.Lock()
+					rf.lastApplied += len(entries)
+				}
+				rf.Unlock()
+			}
+		} else {
+			rf.Unlock()
+			<-time.After(CommitApplyIdleCheckInterval)
+		}
 	}
-	return y
+}
+
+func (rf *Raft) startElectionProcess() {
+	electionTimeout := func() time.Duration { // Randomized timeouts between [500, 600)-ms
+		return (200 + time.Duration(rand.Intn(300))) * time.Millisecond
+	}
+
+	currentTimeout := electionTimeout()
+	currentTime := <-time.After(currentTimeout)
+
+	rf.Lock()
+	defer rf.Unlock()
+	if !rf.isDecommissioned {
+		// Start election process if we're not a leader and the haven't received a heartbeat for `electionTimeout`
+		if rf.state != Leader && currentTime.Sub(rf.lastHeartBeat) >= currentTimeout {
+			RaftInfo("Election timer timed out. Timeout: %fs", rf, currentTimeout.Seconds())
+			go rf.beginElection()
+		}
+		go rf.startElectionProcess()
+	}
+}
+
+func (rf *Raft) beginElection() {
+	rf.Lock()
+
+	rf.transitionToCandidate()
+	RaftInfo("Election started", rf)
+
+	// Request votes from peers
+	lastIndex, lastTerm := rf.getLastEntryInfo()
+	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateID:  rf.id,
+		LastLogTerm:  lastTerm,
+		LastLogIndex: lastIndex,
+	}
+	replies := make([]RequestVoteReply, len(rf.peers))
+	voteChan := make(chan int, len(rf.peers))
+	for i := range rf.peers {
+		if i != rf.me {
+			go rf.sendRequestVote(rf.peers[i], i, voteChan, &args, &replies[i])
+		}
+	}
+	rf.persist()
+	rf.Unlock()
+
+	// Count votes from peers as they come in
+	votes := 1
+	for i := 0; i < len(replies); i++ {
+		reply := replies[<-voteChan]
+		rf.Lock()
+
+		// §5.1: If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
+		if reply.Term > rf.currentTerm {
+			RaftInfo("Switching to follower as %s's term is %d", rf, reply.Id, reply.Term)
+			rf.transitionToFollower(reply.Term)
+			break
+		} else if votes += reply.VoteCount(); votes > len(replies)/2 { // Has majority vote
+			// Ensure that we're still a candidate and that another election did not interrupt
+			if rf.state == Candidate && args.Term == rf.currentTerm {
+				RaftInfo("Election won. Vote: %d/%d", rf, votes, len(rf.peers))
+				go rf.promoteToLeader()
+				break
+			} else {
+				RaftInfo("Election for term %d was interrupted", rf, args.Term)
+				break
+			}
+		}
+		rf.Unlock()
+	}
+	rf.persist()
+	rf.Unlock()
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -264,6 +366,65 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	go rf.startElectionProcess()
+	go rf.startLocalApplyProcess(applyCh)
 
 	return rf
+}
+
+func RaftInfo(format string, rf *Raft, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		args := append([]interface{}{rf.id, rf.currentTerm, rf.state}, a...)
+		log.Printf("[INFO] Raft: [Id: %s | Term: %d | %v] "+format, args...)
+	}
+	return
+}
+
+func RaftDebug(format string, rf *Raft, a ...interface{}) (n int, err error) {
+	if Debug > 1 {
+		args := append([]interface{}{rf.id, rf.currentTerm, rf.state}, a...)
+		log.Printf("[DEBUG] Raft: [Id: %s | Term: %d | %v] "+format, args...)
+	}
+	return
+}
+
+func RPCDebug(format string, svcName string, a ...interface{}) (n int, err error) {
+	if Debug > 1 {
+		args := append([]interface{}{svcName}, a...)
+		log.Printf("[DEBUG] RPC: [%s] "+format, args...)
+	}
+	return
+}
+
+func Min(x, y int) int {
+	if x < y {
+		return x
+	}
+	return y
+}
+func Max(x, y int) int {
+	if x > y {
+		return x
+	}
+	return y
+}
+
+func SendRPCRequest(requestName string, request func() bool) bool {
+	makeRequest := func(successChan chan struct{}) {
+		if ok := request(); ok {
+			successChan <- struct{}{}
+		}
+	}
+
+	for attempts := 0; attempts < RPCMaxTries; attempts++ {
+		rpcChan := make(chan struct{}, 1)
+		go makeRequest(rpcChan)
+		select {
+		case <-rpcChan:
+			return true
+		case <-time.After(RPCTimeout):
+		}
+	}
+
+	return false
 }
