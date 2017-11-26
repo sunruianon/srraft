@@ -17,6 +17,7 @@ package raft
 //   in the same server.
 //
 
+import "math/rand"
 import "sync"
 import "labrpc"
 import "time"
@@ -32,12 +33,14 @@ const (
 	Follower ServerState = "Follower"
 	Candidate = "Candidate"
 	Leader = "Leader"
-
-	Debug = 0
 	
 	RPCTimeout = 50 * time.Millisecond
 	RPCMaxTries = 3
 )
+
+const HeartBeatInterval = 100 * time.Millisecond
+const CommitApplyIdleCheckInterval = 25 * time.Millisecond
+const LeaderPeerTickInterval = 10 * time.Millisecond
 
 type ApplyMsg struct {
 	Index       int
@@ -141,6 +144,22 @@ type RequestVoteReply struct {
 	Term		int
 	VoteGranted bool
 	Id			string
+}
+
+func (reply *RequestVoteReply) VoteCount() int {
+	if reply.VoteGranted {
+		return 1
+	}
+	return 0
+}
+
+func (rf *Raft) findLogIndex(logIndex int) (int, bool) {
+	for i, e := range rf.log {
+		if e.Index == logIndex {
+			return i, true
+		}
+	}
+	return -1, false
 }
 
 func (rf *Raft) transitionToCandidate() {
@@ -318,6 +337,29 @@ func (rf *Raft) beginElection() {
 	}
 	rf.persist()
 	rf.Unlock()
+}
+
+func (rf *Raft) promoteToLeader() {
+	rf.Lock()
+	defer rf.Unlock()
+
+	rf.state = Leader
+	rf.leaderID = rf.id
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.sendAppendChan = make([]chan struct{}, len(rf.peers))
+
+	for i := range rf.peers {
+		if i != rf.me {
+			rf.nextIndex[i] = len(rf.log) + 1 // Should be initialized to leader's last log index + 1
+			rf.matchIndex[i] = 0              // Index of highest log entry known to be replicated on server
+			rf.sendAppendChan[i] = make(chan struct{}, 1)
+
+			// Start routines for each peer which will be used to monitor and send log entries
+			go rf.startLeaderPeerProcess(i, rf.sendAppendChan[i])
+		}
+	}
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
