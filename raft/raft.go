@@ -214,6 +214,198 @@ func (rf *Raft) sendRequestVote(serverConn *labrpc.ClientEnd, server int, voteCh
 	}
 }
 
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.Lock()
+	defer rf.Unlock()
+
+	RaftInfo("Request from %s, w/ %d entries. Args.Prev:[Index %d, Term %d]", rf, args.LeaderID, len(args.LogEntries), args.PreviousLogIndex, args.PreviousLogTerm)
+
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		return
+	} else if args.Term >= rf.currentTerm {
+		rf.transitionToFollower(args.Term)
+		rf.leaderID = args.LeaderID
+	}
+
+	if rf.leaderID == args.LeaderID {
+		rf.lastHeartBeat = time.Now()
+	}
+
+	// Try to find supplied previous log entry match in our log
+	prevLogIndex := -1
+	for i, v := range rf.log {
+		if v.Index == args.PreviousLogIndex {
+			if v.Term == args.PreviousLogTerm {
+				prevLogIndex = i
+				break
+			} else {
+				reply.ConflictingLogTerm = v.Term
+			}
+		}
+	}
+
+	PrevIsInSnapshot := args.PreviousLogIndex == rf.lastSnapshotIndex && args.PreviousLogTerm == rf.lastSnapshotTerm
+	PrevIsBeginningOfLog := args.PreviousLogIndex == 0 && args.PreviousLogTerm == 0
+
+	if prevLogIndex >= 0 || PrevIsInSnapshot || PrevIsBeginningOfLog {
+		if len(args.LogEntries) > 0 {
+			RaftInfo("Appending %d entries from %s", rf, len(args.LogEntries), args.LeaderID)
+		}
+
+		// Remove any inconsistent logs and find the index of the last consistent entry from the leader
+		entriesIndex := 0
+		for i := prevLogIndex + 1; i < len(rf.log); i++ {
+			entryConsistent := func() bool {
+				localEntry, leadersEntry := rf.log[i], args.LogEntries[entriesIndex]
+				return localEntry.Index == leadersEntry.Index && localEntry.Term == leadersEntry.Term
+			}
+			if entriesIndex >= len(args.LogEntries) || !entryConsistent() {
+				// Additional entries must be inconsistent, so let's delete them from our local log
+				rf.log = rf.log[:i]
+				break
+			} else {
+				entriesIndex++
+			}
+		}
+
+		// Append all entries that are not already in our log
+		if entriesIndex < len(args.LogEntries) {
+			rf.log = append(rf.log, args.LogEntries[entriesIndex:]...)
+		}
+
+		// Update the commit index
+		if args.LeaderCommit > rf.commitIndex {
+			var latestLogIndex = rf.lastSnapshotIndex
+			if len(rf.log) > 0 {
+				latestLogIndex = rf.log[len(rf.log)-1].Index
+			}
+
+			if args.LeaderCommit < latestLogIndex {
+				rf.commitIndex = args.LeaderCommit
+			} else {
+				rf.commitIndex = latestLogIndex
+			}
+		}
+		reply.Success = true
+	} else {
+		// §5.3: When rejecting an AppendEntries request, the follower can include the term of the
+		//	 	 conflicting entry and the first index it stores for that term.
+
+		// If there's no entry with `args.PreviousLogIndex` in our log. Set conflicting term to that of last log entry
+		if reply.ConflictingLogTerm == 0 && len(rf.log) > 0 {
+			reply.ConflictingLogTerm = rf.log[len(rf.log)-1].Term
+		}
+
+		for _, v := range rf.log { // Find first log index for the conflicting term
+			if v.Term == reply.ConflictingLogTerm {
+				reply.ConflictingLogIndex = v.Index
+				break
+			}
+		}
+
+		reply.Success = false
+	}
+	rf.persist()
+}
+
+func (rf *Raft) sendAppendEntryRequest(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	requestName := "Raft.AppendEntries"
+	request := func() bool {
+		return rf.peers[server].Call(requestName, args, reply)
+	}
+	return SendRPCRequest(requestName, request)
+}
+
+func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
+	rf.Lock()
+
+	if rf.state != Leader || rf.isDecommissioned {
+		rf.Unlock()
+		return
+	}
+
+	var entries []LogEntry = []LogEntry{}
+	var prevLogIndex, prevLogTerm int = 0, 0
+
+	peerId := string(rune(peerIndex + 'A'))
+	lastLogIndex, _ := rf.getLastEntryInfo()
+
+	if lastLogIndex > 0 && lastLogIndex >= rf.nextIndex[peerIndex] {
+		if rf.nextIndex[peerIndex] <= rf.lastSnapshotIndex { // We don't have the required entry in our log; sending snapshot.
+			rf.Unlock()
+			rf.sendSnapshot(peerIndex, sendAppendChan)
+			return
+		} else {
+			for i, v := range rf.log { // Need to send logs beginning from index `rf.nextIndex[peerIndex]`
+				if v.Index == rf.nextIndex[peerIndex] {
+					if i > 0 {
+						lastEntry := rf.log[i-1]
+						prevLogIndex, prevLogTerm = lastEntry.Index, lastEntry.Term
+					} else {
+						prevLogIndex, prevLogTerm = rf.lastSnapshotIndex, rf.lastSnapshotTerm
+					}
+					entries = make([]LogEntry, len(rf.log)-i)
+					copy(entries, rf.log[i:])
+					break
+				}
+			}
+			RaftInfo("Sending log %d entries to %s", rf, len(entries), peerId)
+		}
+	} else { // We're just going to send a heartbeat
+		if len(rf.log) > 0 {
+			lastEntry := rf.log[len(rf.log)-1]
+			prevLogIndex, prevLogTerm = lastEntry.Index, lastEntry.Term
+		} else {
+			prevLogIndex, prevLogTerm = rf.lastSnapshotIndex, rf.lastSnapshotTerm
+		}
+	}
+
+	reply := AppendEntriesReply{}
+	args := AppendEntriesArgs{
+		Term:             rf.currentTerm,
+		LeaderID:         rf.id,
+		PreviousLogIndex: prevLogIndex,
+		PreviousLogTerm:  prevLogTerm,
+		LogEntries:       entries,
+		LeaderCommit:     rf.commitIndex,
+	}
+	rf.Unlock()
+
+	ok := rf.sendAppendEntryRequest(peerIndex, &args, &reply)
+
+	rf.Lock()
+	defer rf.Unlock()
+
+	if !ok {
+		RaftDebug("Communication error: AppendEntries() RPC failed", rf)
+	} else if rf.state != Leader || rf.isDecommissioned || args.Term != rf.currentTerm {
+		RaftInfo("Node state has changed since request was sent. Discarding response", rf)
+	} else if reply.Success {
+		if len(entries) > 0 {
+			RaftInfo("Appended %d entries to %s's log", rf, len(entries), peerId)
+			lastReplicated := entries[len(entries)-1]
+			rf.matchIndex[peerIndex] = lastReplicated.Index
+			rf.nextIndex[peerIndex] = lastReplicated.Index + 1
+			rf.updateCommitIndex()
+		} else {
+			RaftDebug("Successful heartbeat from %s", rf, peerId)
+		}
+	} else {
+		if reply.Term > rf.currentTerm {
+			RaftInfo("Switching to follower as %s's term is %d", rf, peerId, reply.Term)
+			rf.transitionToFollower(reply.Term)
+		} else {
+			RaftInfo("Log deviation on %s. T: %d, nextIndex: %d, args.Prev[I: %d, T: %d], FirstConflictEntry[I: %d, T: %d]", rf, peerId, reply.Term, rf.nextIndex[peerIndex], args.PreviousLogIndex, args.PreviousLogTerm, reply.ConflictingLogIndex, reply.ConflictingLogTerm)
+			// Log deviation, we should go back to `ConflictingLogIndex - 1`, lowest value for nextIndex[peerIndex] is 1.
+			rf.nextIndex[peerIndex] = Max(reply.ConflictingLogIndex-1, 1)
+			sendAppendChan <- struct{}{} // Signals to leader-peer process that appends need to occur
+		}
+	}
+	rf.persist()
+}
+
 func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 	rf.Lock()
 	RaftInfo("Starting commit process - Last log applied: %d", rf, rf.lastApplied)
@@ -358,6 +550,35 @@ func (rf *Raft) promoteToLeader() {
 
 			// Start routines for each peer which will be used to monitor and send log entries
 			go rf.startLeaderPeerProcess(i, rf.sendAppendChan[i])
+		}
+	}
+}
+
+func (rf *Raft) startLeaderPeerProcess(peerIndex int, sendAppendChan chan struct{}) {
+	ticker := time.NewTicker(LeaderPeerTickInterval)
+
+	// Initial heartbeat
+	rf.sendAppendEntries(peerIndex, sendAppendChan)
+	lastEntrySent := time.Now()
+
+	for {
+		rf.Lock()
+		if rf.state != Leader || rf.isDecommissioned {
+			ticker.Stop()
+			rf.Unlock()
+			break
+		}
+		rf.Unlock()
+
+		select {
+		case <-sendAppendChan: // Signal that we should send a new append to this peer
+			lastEntrySent = time.Now()
+			rf.sendAppendEntries(peerIndex, sendAppendChan)
+		case currentTime := <-ticker.C: // If traffic has been idle, we should send a heartbeat
+			if currentTime.Sub(lastEntrySent) >= HeartBeatInterval {
+				lastEntrySent = time.Now()
+				rf.sendAppendEntries(peerIndex, sendAppendChan)
+			}
 		}
 	}
 }
