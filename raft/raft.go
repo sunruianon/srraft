@@ -800,6 +800,12 @@ func (rf *Raft) persist() {
 //
 // restore previously persisted state.
 //
+func (ps *Persister) SnapshotSize() int {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	return len(ps.snapshot)
+}
+
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 {
 		return
